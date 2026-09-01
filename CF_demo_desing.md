@@ -2,12 +2,11 @@
 
 **Status:** Draft for review · **Date:** 2026-09-01 · **Audience:** integration partner engineering, NEAR Intents engineering
 
-A lightweight demo showing how a Cloudflares's x402 monetization gateway can offer sellers **automatic settlement on any of 35+ chains and 180+ tokens** while buyers keep paying stablecoins over standard x402 on any [Coinbase CDP facilitator network](https://docs.cdp.coinbase.com/x402/seller/facilitator) — with **zero changes to the x402 protocol, the facilitator, or buyer-side clients**.
+A lightweight demo showing how a Cloudflare's x402 monetization gateway can offer sellers **automatic settlement on any of 35+ chains and 180+ tokens** while buyers keep paying stablecoins over standard x402 on any [Coinbase CDP facilitator network](https://docs.cdp.coinbase.com/x402/seller/facilitator) — with **zero changes to the x402 protocol, the facilitator, or buyer-side clients**.
 
 The mechanism: the x402 `payTo` address is set to a [1Click Swap API](https://docs.near-intents.org/) (1CS) deposit address from a live quote. The facilitator's on-chain settlement transaction *is* the swap deposit. NEAR Intents then delivers the seller's configured token on the seller's configured chain, asynchronously, with no custody hop in between.
 
 ---
-
 
 ## Background
 
@@ -40,12 +39,9 @@ flowchart LR
         B["Buyer / agent<br/>x402 client + wallet"]
     end
 
-    subgraph pe ["Partner edge"]
+    subgraph pe ["Partner edge — one deployable unit"]
         MG["Monetization gateway<br/>(402 issuance, verify/settle calls,<br/>resource release)"]
-    end
-
-    subgraph new ["New component (this demo)"]
-        GW["1CS Settlement Gateway<br/>quote builder · settlement tracker<br/>seller config · refund ledger"]
+        GW["1CS settlement module (new)<br/>quote builder · settlement tracker<br/>seller config · refund ledger"]
     end
 
     subgraph ext ["External services"]
@@ -57,16 +53,16 @@ flowchart LR
     DEST["Seller chain + token<br/>any of 35+ chains"]
 
     B -- "1: GET resource / retry with payment" --> MG
-    MG -- "2: PaymentRequirements?" --> GW
+    MG -- "2: buildRequirements" --> GW
     GW -- "3: POST /v0/quote (EXACT_OUTPUT, wet)" --> ONE
     MG -- "4: verify / settle" --> FAC
     FAC -- "5: transfer buyer → depositAddress" --> ORIG
-    MG -- "6: settled {txHash}" --> GW
+    MG -- "6: recordSettlement {txHash}" --> GW
     GW -- "7: deposit/submit + poll status" --> ONE
     ONE -- "8: swap + withdrawal" --> DEST
 ```
 
-Money flows exactly once on the buyer side (buyer → deposit address, edge 5) and once on the seller side (NEAR Intents → seller address, edge 8). The gateway service touches control flow only — it never holds funds.
+Money flows exactly once on the buyer side (buyer → deposit address, edge 5) and once on the seller side (NEAR Intents → seller address, edge 8). The settlement module touches control flow only — it never holds funds.
 
 ## Buyer / seller flow
 
@@ -77,12 +73,12 @@ sequenceDiagram
     autonumber
     participant B as Buyer (x402 client)
     participant MG as Partner Monetization Gateway
-    participant GW as 1CS Settlement Gateway
+    participant GW as 1CS settlement module
     participant OC as 1Click Swap API
     participant F as CDP Facilitator
 
     B->>MG: GET /resource
-    MG->>GW: GET payment requirements (resource price, seller id)
+    MG->>GW: buildRequirements(resource, price) — internal call
     loop per advertised network
         GW->>OC: POST /v0/quote {dry:false, swapType:EXACT_OUTPUT,<br/>amount:price, destinationAsset:sellerToken,<br/>recipient:sellerAddr, refundTo:partnerRefundAddr, deadline}
         OC-->>GW: {depositAddress, amountIn, amountOut, deadline}
@@ -97,26 +93,26 @@ sequenceDiagram
     F->>F: broadcast transfer buyer → depositAddress, confirm
     F-->>MG: {success, txHash, network}
     MG-->>B: 200 OK + resource  «buyer done, seconds after retry»
-    MG->>GW: settlement notification {depositAddress, txHash}
+    MG->>GW: recordSettlement(depositAddress, txHash) — internal call
     GW->>OC: POST /v0/deposit/submit {depositAddress, txHash}
     loop until terminal status
         GW->>OC: GET /v0/status/{depositAddress}
     end
     OC-->>GW: SUCCESS «seller paid on their chain in their token»
-    GW-->>MG: settlement record final (for seller dashboard / reporting)
+    GW-->>MG: terminal status in ledger (seller monitoring endpoint)
 ```
 
 Narrative, in the style of the x402 spec flow:
 
 1. **Buyer → edge**: request a gated resource.
-2. **Edge → gateway service**: fetch `PaymentRequirements` for this request. The gateway holds the seller's settlement config (chain, token, address) and the resource price in seller terms.
-3. **Gateway → 1CS**: one wet `EXACT_OUTPUT` quote per advertised buyer network. `amount` = resource price in the seller's token; 1CS returns `amountIn` (what the buyer must pay, price + swap cost) and a unique `depositAddress` valid until `deadline`.
+2. **Edge → settlement module**: build `PaymentRequirements` for this request — an internal call. The module holds the seller's settlement config (chain, token, address); the price in seller terms comes from the gateway's pricing rules.
+3. **Module → 1CS**: one wet `EXACT_OUTPUT` quote per advertised buyer network. `amount` = resource price in the seller's token; 1CS returns `amountIn` (what the buyer must pay, price + swap cost) and a unique `depositAddress` valid until `deadline`.
 4. **Edge → buyer**: `402` with one `accepts[]` entry per network. Per entry: `scheme: "exact"`, `network` (CAIP-2), `asset` = origin-chain USDC contract, `amount` = `amountIn`, `payTo` = `depositAddress`, `maxTimeoutSeconds` well inside the quote deadline. Quote metadata (`amountOut`, seller chain/token, quote deadline, correlation id) rides in `extra`.
 5. **Buyer**: standard x402 client behavior — choose an entry, sign, retry. Nothing 1CS-specific.
 6. **Edge → facilitator**: `verify`, then `settle`. The facilitator broadcasts the buyer's transfer **to the deposit address** and confirms it. This is stock CDP facilitator behavior; it neither knows nor cares that `payTo` is a swap deposit.
-7. **Edge → buyer**: `200 OK` with the resource as soon as `settle` succeeds. Buyer-perceived latency is identical to stock x402. The gateway service does not monitor the payment chain at all.
-8. **Edge → gateway service**: fire-and-forget settlement notification carrying the settle `txHash`.
-9. **Gateway → 1CS**: `deposit/submit` with the txHash (accelerates detection; 1CS would also detect the deposit on its own), then poll `status/{depositAddress}`.
+7. **Edge → buyer**: `200 OK` with the resource as soon as `settle` succeeds. Buyer-perceived latency is identical to stock x402. The settlement module does not monitor the payment chain at all.
+8. **Edge → settlement module**: hand off the settle result (`depositAddress`, `txHash`) — internal, fire-and-forget.
+9. **Module → 1CS**: `deposit/submit` with the txHash (accelerates detection; 1CS would also detect the deposit on its own), then poll `status/{depositAddress}`.
 10. **1CS**: executes the swap and withdraws to the seller's address on the seller's chain. Status reaches `SUCCESS` — the seller leg is complete, typically seconds to a few minutes after step 7 depending on origin-chain finality.
 
 An example `accepts[]` entry (buyer pays USDC on Base; seller configured for USDC on NEAR, price $0.10):
@@ -149,8 +145,8 @@ An example `accepts[]` entry (buyer pays USDC on Base; seller configured for USD
 | Settlement lands after quote `deadline` | 1CS refunds the deposit to `refundTo` (partner-controlled). **Buyer has paid and received the resource; seller is not paid.** | Ops: reconcile and pay out the seller from the refund wallet. Mitigated by `maxTimeoutSeconds` ≪ deadline and an edge-side freshness check before `settle`. |
 | Swap fails / route unavailable mid-flight | 1CS status `REFUNDED` or `FAILED`; funds to `refundTo`. Same asymmetry as above. | Ops reconciliation. Rare for stable→stable routes. |
 | Duplicate payment to same deposit address | Surplus over `amountIn` is refunded to `refundTo`. | Ops. Edge should never reuse an `accepts[]` entry across payments. |
-| Gateway service down at 402 time | No `PaymentRequirements` → edge fails open or closed per policy (demo: fail closed with 503). | Buyer sees an error; no funds at risk. |
-| Gateway service down at notification time | 1CS still detects the deposit on-chain by itself; swap completes. Gateway back-fills status by polling on restart. | Seller reporting delayed only. |
+| 1CS quote API unreachable at 402 time | No `PaymentRequirements` → gateway fails open or closed per policy (demo: fail closed with 503). | Buyer sees an error; no funds at risk. |
+| Settlement tracker down at handoff time | 1CS still detects the deposit on-chain by itself; swap completes. The tracker back-fills status by polling on restart. | Seller reporting delayed only. |
 
 The one structurally new risk is the third row: buyer-paid-but-seller-unpaid, with funds parked in the refund wallet. It is bounded (per-request amounts), detectable (every such case is a `REFUNDED`/expired ledger entry), and rare (facilitator settles in seconds; deadlines are minutes) — but it is the item to design away on the path to production.
 
@@ -171,24 +167,20 @@ Demo coverage: **4 of 5 facilitator mainnets**, USDC as the advertised buyer ass
 
 Seller side: any of the 35 chains / ~188 assets on `GET /v0/tokens` — e.g. USDC on NEAR (`nep141:17208628…36133a1`), USDT on Tron (`nep141:tron-d28a…omft.near`), USDC on Stellar, USDT on TON, or any facilitator network itself.
 
-## The gateway service — spec
+## The 1CS settlement component — spec
 
-A single small stateless-leaning HTTP service (TypeScript/Node, containerized; 1CS calls via the official `@defuse-protocol/one-click-sdk-typescript` SDK). It does exactly two things — quote issuance and post-settlement tracking — and deliberately contains **no verify/settle logic, no payment-chain RPC, and no keys**: payment verification and on-chain settlement stay entirely with the CDP facilitator.
+A single small TypeScript/Node component (1CS calls via the official `@defuse-protocol/one-click-sdk-typescript` SDK). It does two things — quote issuance and post-settlement tracking — and contains **no verify/settle logic, no payment-chain RPC, and no keys**; payment verification and on-chain settlement stay with the CDP facilitator. Its only secret is the 1CS API JWT (Near One-provisioned; unauthenticated 1CS calls carry a 0.2% fee).
 
-### Endpoints
+It is **internal logic of the monetization gateway**: same operator, deployed as one unit — in the demo, one process configured for one seller; in production, either one instance per merchant/seller or a shared config-driven deployment (per-seller settings are pure config). The two integration points are in-process function calls — or the same calls against a co-deployed private sidecar bound to localhost where the edge runtime can't embed a Node module. The only exposed surface is the seller-monitoring endpoint.
 
-| Endpoint | Purpose |
+### Internal interfaces and internal logic
+
+| Interface | Purpose |
 |---|---|
-| `POST /v1/requirements` | Called by the partner's edge whenever it must construct a 402. Body: `{ sellerId, resource, priceOut }`. Runs one wet `EXACT_OUTPUT` 1CS quote per advertised network and returns the x402 `accepts[]` array. Latency budget ≈ 1 quote round-trip (quotes run in parallel), target < 1 s. |
-| `POST /v1/settlements` | Called by the partner's edge right after a successful facilitator `settle`. Body: `{ depositAddress, txHash, network, payer? }`. Idempotent (keyed on `depositAddress`, insert-only). Calls 1CS `deposit/submit`, starts status polling to a terminal state. Returns `202`. |
-| `GET /v1/settlements/{depositAddress}` | Correlated view for seller dashboard / ops: quote params, payment txHash, live 1CS status, refund flag. |
-| `GET /health` | Liveness + 1CS reachability. |
+| `buildRequirements(resource, priceOut)` | Invoked by the 402-construction path. The seller is the instance's config (a shared multi-tenant deployment adds a seller id). Runs one wet `EXACT_OUTPUT` 1CS quote per advertised network (in parallel) and returns the x402 `accepts[]` array. Latency ≈ one quote round-trip, target < 1 s. |
+| `recordSettlement(depositAddress, txHash, network)` | Invoked right after a successful facilitator `settle`. Idempotent (keyed on `depositAddress`, insert-only). Hands off to the settlement tracker. |
 
-Auth between edge and gateway: static API key header for the demo (mTLS or equivalent internal service auth in production). The gateway authenticates to 1CS with a Near One-provisioned JWT (unauthenticated 1CS calls carry a 0.2% fee — avoided in the demo).
-
-### Quote mapping
-
-For each advertised network, `POST /v0/quote` with:
+**Quote construction** — for each advertised network, `POST /v0/quote` with:
 
 | 1CS parameter | Value |
 |---|---|
@@ -204,6 +196,14 @@ For each advertised network, `POST /v0/quote` with:
 | `referral` | optional partner referral tag — 1CS supports app-fee sharing per referral |
 
 Response → x402 mapping: `amountIn` → `amount`, origin token contract → `asset`, `depositAddress` → `payTo`, `maxTimeoutSeconds` = `min(QUOTE_TTL − buffer, 300 s)`; everything else → `extra`. The edge must treat 402 bodies as uncacheable — every payment request needs fresh deposit addresses.
+
+**Ledger** — one insert-only table keyed by `depositAddress`, opened at quote time: quote snapshot → payment txHash → 1CS terminal status (`SUCCESS` / `REFUNDED` / `FAILED` / expired). Demo persistence: JSON file snapshot (the source of truth for any individual swap remains the 1CS status endpoint, so the ledger is reconstructible). Entries whose quotes expire unpaid are pruned; `REFUNDED`/`FAILED` entries are never pruned — they are the ops reconciliation queue.
+
+**Settlement tracker** — a long-lived background task. On handoff, calls `deposit/submit` best-effort (a failure is non-fatal — 1CS detects the deposit on-chain regardless), then polls `GET /v0/status/{depositAddress}` every ~5 s with a per-call timeout until a terminal status. An entry still non-terminal after 30 minutes is flagged `STALE` for ops and drops to low-frequency polling. On restart, the tracker re-polls every open ledger entry, so no swap is lost to a crash.
+
+### Exposed interface / API
+
+`GET /v1/settlements/{depositAddress}` — the component's only public endpoint, for seller dashboards and ops tooling. Returns the correlated view of one payment: quote parameters, origin-chain payment `txHash`, live 1CS status, and a refund flag.
 
 ### Configuration
 
@@ -222,12 +222,6 @@ Response → x402 mapping: `amountIn` → `amount`, origin token contract → `a
 }
 ```
 
-### State
-
-One insert-only ledger keyed by `depositAddress`: quote snapshot → payment txHash → 1CS terminal status (`SUCCESS` / `REFUNDED` / `FAILED` / expired). Demo persistence: JSON file snapshot (crash-safe enough for a demo; the source of truth for any individual swap remains the 1CS status endpoint, so the ledger is reconstructible). Entries whose quotes expire unpaid are pruned; `REFUNDED`/`FAILED` entries are never pruned — they are the ops reconciliation queue.
-
-Settlement tracker behavior: on notification, call `deposit/submit` best-effort (a failure is non-fatal — 1CS detects the deposit on-chain regardless), then poll `GET /v0/status/{depositAddress}` every ~5 s with a per-call timeout until a terminal status. An entry still non-terminal after 30 minutes is flagged `STALE` for ops and drops to low-frequency polling. On restart, the tracker re-polls every open ledger entry, so no swap is ever lost to a crash.
-
 ### Non-goals for the demo
 
 - No `verify`/`settle` implementation, no payment-chain RPC, no wallets in the service.
@@ -240,10 +234,9 @@ Settlement tracker behavior: on notification, call `deposit/submit` best-effort 
 
 Since the monetization gateway itself is partner-internal, the demo stands in for the edge with a minimal resource server wired exactly the way the real edge would be:
 
-1. **1CS Settlement Gateway** — the service specced above.
-2. **Demo edge** — a paywalled `GET /article` behind stock x402 middleware pointed at the CDP facilitator for verify/settle, fetching `accepts[]` from (1) and posting the settle result back to (1). ~200 lines; its only purpose is to mark the exact two integration points the partner's edge would implement.
-3. **Buyer clients** — scripts using the standard x402 client SDKs, one EVM wallet (Base/Polygon/Arbitrum USDC) and one Solana wallet, funded with a few dollars.
-4. **Demo script** — one run per origin network: buyer pays USDC on Base → seller receives USDC on NEAR (and one flashier route, e.g. Solana USDC → Tron USDT), showing the buyer's sub-5-second 200 OK and the seller's on-chain payout minutes later, plus one forced-failure run showing the refund ledger.
+1. **Monetization-gateway demo app** — one process: a paywalled `GET /article` behind stock x402 middleware pointed at the CDP facilitator for verify/settle, with the 1CS settlement module (specced above) embedded at the two integration points — 402 construction and post-settle handoff — plus the exposed monitoring endpoint. The x402/facilitator wiring is ~200 lines; its only purpose is to mark exactly what the partner's edge would implement.
+2. **Buyer clients** — scripts using the standard x402 client SDKs, one EVM wallet (Base/Polygon/Arbitrum USDC) and one Solana wallet, funded with a few dollars.
+3. **Demo script** — one run per origin network: buyer pays USDC on Base → seller receives USDC on NEAR (and one flashier route, e.g. Solana USDC → Tron USDT), showing the buyer's sub-5-second 200 OK and the seller's on-chain payout minutes later, plus one forced-failure run showing the refund ledger.
 
 Everything runs on mainnet with cent-sized prices (the CDP facilitator's free tier of 1,000 settlements/month more than covers a demo).
 
@@ -253,8 +246,8 @@ Single engineer, assuming existing 1CS partner JWT and CDP API keys:
 
 | Work item | Estimate |
 |---|---|
-| Gateway service: `requirements` + `settlements` endpoints, multi-network quote fan-out (official 1CS TypeScript SDK), settlement tracker, ledger, config | 5–6 days |
-| Demo edge with x402 middleware + CDP facilitator wiring | 2 days |
+| 1CS settlement module: requirements builder, multi-network quote fan-out (official 1CS TypeScript SDK), settlement tracker, ledger, config, monitoring endpoint | 5–6 days |
+| Demo app around it: x402 middleware + CDP facilitator wiring | 2 days |
 | Buyer clients (EVM + Solana) and wallet funding | 1–2 days |
 | Mainnet end-to-end runs, TTL/timeout calibration, forced-failure path, demo script + README | 2 days |
 | **Total** | **≈ 2 engineer-weeks** |
@@ -279,12 +272,12 @@ Phased, each phase independently shippable:
 **Phase 1 — Hardened single-tenant service** (from the demo)
 - Durable store (SQL) for the settlement ledger; idempotent notification handling; restart-safe poller back-fill.
 - Real observability: metrics (quote latency, settle→SUCCESS lag, refund rate), alerting on `REFUNDED`/`FAILED`/expiry races, reconciliation export.
-- Security hardening: mTLS or the partner's internal service auth between edge and gateway, secret rotation, quote-rate limits per seller.
+- Security hardening: 1CS JWT rotation, quote-rate limits per seller; in sidecar packaging, localhost binding / internal service auth for the module's interfaces.
 - Runbooks: refund-wallet reconciliation, 1CS incident handling, stuck-swap escalation.
 
 **Phase 2 — Product integration with the partner**
 - Move seller settlement config into the monetization gateway's rules (per-seller chain/token/address, advertised networks, price), delivered to the gateway per request or via config sync.
-- Decide hosting: gateway as a partner-operated service (edge containers/serverless, lowest latency to the edge) vs Near One-hosted multi-tenant API (fastest to integrate). The service is small and stateless enough for either.
+- Decide deployment granularity: per-merchant gateway instances co-deployed with the resource server vs one shared config-driven service for all sellers. The service is small and stateless enough for either; per-seller settings are pure config.
 - Wire the settle notification as a first-class edge hook; define fail-open/closed policy when the gateway is unreachable.
 - Fee model: partner referral tag on quotes for revenue share; decide who carries the swap spread.
 
@@ -299,12 +292,12 @@ Phased, each phase independently shippable:
 
 ## Questions for the partner
 
-1. **Integration surface.** Can the monetization gateway's rules delegate `PaymentRequirements` construction to an external source per request (dynamic `payTo`/`amount`)? What is the latency budget for 402 construction at the edge?
-2. **Settle hook.** Can the edge emit the facilitator settle result (`network`, `txHash`, `payTo`) to an external endpoint immediately after settlement? (Without it the flow still works via 1CS's own deposit detection, just seconds slower on the seller leg.)
+1. **Integration surface.** Can the monetization gateway construct `PaymentRequirements` dynamically per request (fresh `payTo`/`amount` from a 1CS quote via the embedded module), rather than from static rule config? What is the latency budget for 402 construction at the edge?
+2. **Settle hook.** Can the 402/settle path invoke the settlement module with the facilitator settle result (`network`, `txHash`, `payTo`) immediately after settlement? (Without it the flow still works via 1CS's own on-chain deposit detection, just seconds slower on the seller leg.)
 3. **Caching.** Confirm 402 responses on monetized routes are never cached — every response carries single-use deposit addresses.
 4. **Refund custody.** Is the partner comfortable operating per-network refund wallets and the reconciliation flow?
 5. **Seller config.** Where should seller settlement preferences live (dashboard rules?), and how are they delivered to the settlement service — per-request or synced?
-6. **Hosting preference.** Partner-operated gateway (edge service/container) with Near One supplying the software and 1CS credentials, or a Near One-hosted API? (Both work; this determines the security/SLA design.)
+6. **Deployment granularity and packaging.** The settlement component runs inside the monetization gateway, with Near One supplying the software and 1CS credentials. One instance per merchant/seller, or a single shared config-driven deployment? Embedded in-process (Node), or a co-deployed private sidecar where the edge runtime can't host it? (Same code either way; this determines config delivery and SLA design.)
 7. **Network and asset priorities.** How important is World Chain for launch (it gates a 1CS roadmap item)? USDC-only on the buyer side, or USDT variants too?
 8. **Fees.** Should the partner take a revenue share via the 1CS referral mechanism? Who absorbs the buyer-side swap spread — surfaced to the buyer, or netted from the seller?
 9. **Volume expectations.** Rough 402-issuance and paid-conversion volumes, to size quote-generation rate limits and the 1CS capacity ask.
