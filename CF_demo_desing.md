@@ -8,9 +8,10 @@ The mechanism: the x402 `payTo` address is set to a [1Click Swap API](https://do
 
 ---
 
+
 ## Background
 
-**The monetization gateway** gates web pages, datasets, APIs, and MCP tools behind usage-based micropayments at the edge. Payments use **x402**: the buyer receives `402 Payment Required` with machine-readable `PaymentRequirements`, signs a stablecoin payment (EIP-3009 / Permit2 on EVM, SPL on Solana), and retries; a **facilitator** (Coinbase CDP) verifies and settles on-chain, and the edge returns the resource. Today the seller accumulates stablecoins on the payment network and redeems them out-of-band.
+**The monetization gateway** gates web pages, datasets, APIs, and MCP tools behind usage-based micropayments at the edge — the partner's proxy layer that terminates buyer requests in front of the seller's origin. Throughout this doc, "the edge" means that component: the monetization gateway itself, which in x402 terms plays the resource-server role. Payments use **x402**: the buyer receives `402 Payment Required` with machine-readable `PaymentRequirements`, signs a stablecoin payment (EIP-3009 / Permit2 on EVM, SPL on Solana), and retries; a **facilitator** (Coinbase CDP) verifies and settles on-chain, and the edge returns the resource. Today the seller accumulates stablecoins on the payment network and redeems them out-of-band.
 
 **NEAR Intents 1Click Swap API** (`https://1click.chaindefuser.com`) abstracts cross-chain swaps into a REST flow: request a quote, receive a unique `depositAddress`, send funds to it, and the swap executes and delivers to the recipient on the destination chain. It currently spans **35 blockchains** (EVM chains, Solana, Bitcoin, NEAR, TON, Tron, Stellar, XRP, Sui, Aptos, Cardano, …) and ~188 tokens.
 
@@ -178,12 +179,10 @@ A single small stateless-leaning HTTP service (TypeScript/Node, containerized; 1
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/requirements` | Body: `{ sellerId, resource, priceOut }`. Runs one wet `EXACT_OUTPUT` 1CS quote per advertised network and returns the x402 `accepts[]` array. Latency budget ≈ 1 quote round-trip (quotes run in parallel), target < 1 s. |
-| `POST /v1/settlements` | Body: `{ depositAddress, txHash, network, payer? }`. Idempotent (keyed on `depositAddress`, insert-only). Calls 1CS `deposit/submit`, starts status polling to a terminal state. Returns `202`. |
+| `POST /v1/requirements` | Called by the partner's edge whenever it must construct a 402. Body: `{ sellerId, resource, priceOut }`. Runs one wet `EXACT_OUTPUT` 1CS quote per advertised network and returns the x402 `accepts[]` array. Latency budget ≈ 1 quote round-trip (quotes run in parallel), target < 1 s. |
+| `POST /v1/settlements` | Called by the partner's edge right after a successful facilitator `settle`. Body: `{ depositAddress, txHash, network, payer? }`. Idempotent (keyed on `depositAddress`, insert-only). Calls 1CS `deposit/submit`, starts status polling to a terminal state. Returns `202`. |
 | `GET /v1/settlements/{depositAddress}` | Correlated view for seller dashboard / ops: quote params, payment txHash, live 1CS status, refund flag. |
 | `GET /health` | Liveness + 1CS reachability. |
-
-**Why a `requirements` endpoint at all** — the edge could call 1CS `POST /v0/quote` directly, but this endpoint is what keeps the edge free of NEAR Intents knowledge. It owns the x402↔1CS translation in one place (per-network origin-asset mapping, `EXACT_OUTPUT` parameterization, `amountIn`→`amount` / `depositAddress`→`payTo` shaping, timeout calibration), holds the seller config, refund addresses, and 1CS partner JWT — none of which belong at the edge — and opens the ledger entry at quote time, which is what lets the later settlement notification correlate a bare `{depositAddress, txHash}` back to a quote and seller. The edge's contract stays protocol-shaped: price and seller in, `accepts[]` out.
 
 Auth between edge and gateway: static API key header for the demo (mTLS or equivalent internal service auth in production). The gateway authenticates to 1CS with a Near One-provisioned JWT (unauthenticated 1CS calls carry a 0.2% fee — avoided in the demo).
 
